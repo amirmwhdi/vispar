@@ -1,0 +1,120 @@
+name: Linux packages
+
+# Builds the Linux packages of the desktop app and installs each one on a clean distribution:
+# .pacman on Arch, .rpm on Fedora, .deb on Debian and Ubuntu, and the AppImage on the runner.
+# Each must install with its package manager, have no missing library, put its menu entry and
+# icons in place, and open its window. Runs on pull requests that touch the desktop build.
+on:
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'scripts/build-icons.js'
+      - 'scripts/ci/linux-package-test.sh'
+      - '.github/workflows/desktop.yml'
+      - '.github/workflows/linux-packages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:web
+      - name: Install rpmbuild and bsdtar
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm libarchive-tools
+      - name: Build the Linux packages
+        working-directory: desktop
+        run: |
+          npm ci
+          npx electron-builder --linux AppImage deb rpm pacman --publish never
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-packages
+          path: |
+            release/*.AppImage
+            release/*.deb
+            release/*.rpm
+            release/*.pacman
+          if-no-files-found: error
+          retention-days: 3
+
+  install:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: arch, image: 'archlinux:latest', file: '*.pacman' }
+          - { distro: fedora, image: 'fedora:latest', file: '*.rpm' }
+          - { distro: debian, image: 'debian:stable', file: '*.deb' }
+          - { distro: ubuntu, image: 'ubuntu:24.04', file: '*.deb' }
+    name: install (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/ci
+      - uses: actions/download-artifact@v7
+        with:
+          name: linux-packages
+          path: pkgs
+      - name: Install and run
+        shell: bash
+        run: bash scripts/ci/linux-package-test.sh ${{ matrix.distro }} pkgs/${{ matrix.file }}
+
+  appimage:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/ci
+      - uses: actions/download-artifact@v7
+        with:
+          name: linux-packages
+          path: pkgs
+      - name: Install the test tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb x11-utils
+      - name: Icons, menu entry and window
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x pkgs/*.AppImage
+          (cd pkgs && ./*.AppImage --appimage-extract >/dev/null)
+          root=pkgs/squashfs-root
+          for n in 16 24 32 48 64 128 256 512; do
+            test -f "$root/usr/share/icons/hicolor/${n}x${n}/apps/vispar-desktop.png" || { echo "::error::missing ${n}px icon"; exit 1; }
+          done
+          grep -qx 'Icon=vispar-desktop' "$root/vispar-desktop.desktop"
+          grep -qx 'StartupWMClass=vispar-desktop' "$root/vispar-desktop.desktop"
+          test -s "$root/.DirIcon"
+          Xvfb :99 -screen 0 1280x800x24 -nolisten tcp 2>/dev/null &
+          export DISPLAY=:99
+          sleep 2
+          # --appimage-extract-and-run sets APPIMAGE like a normal launch, without FUSE.
+          ./pkgs/*.AppImage --appimage-extract-and-run --no-sandbox --disable-gpu > /tmp/run.log 2>&1 &
+          for _ in $(seq 1 45); do
+            for id in $(xwininfo -root -tree | awk '/"vispar-desktop" "vispar-desktop"/ {print $1}'); do
+              xwininfo -id "$id" | grep -q 'Map State: IsViewable' && { echo "window $id is viewable"; exit 0; }
+            done
+            sleep 1
+          done
+          cat /tmp/run.log
+          echo "::error::the AppImage did not open its window"
+          exit 1
